@@ -1,0 +1,417 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import train_test_split
+import warnings
+warnings.filterwarnings('ignore')
+
+# 设置随机种子，保证可复现
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+torch.backends.cudnn.deterministic = True
+
+# 1. 数据读取与整合
+def load_and_merge_data():
+    # 读取三个高度的数据集
+    df_10m = pd.read_csv('data/风速10米_合并结果.csv')
+    df_50m = pd.read_csv('data/风速50米_合并结果.csv')
+    df_100m = pd.read_csv('data/风速100米_合并结果.csv')
+
+    # 统一列名
+    df_10m = df_10m.rename(columns={
+        'Date & Time Stamp': 'timestamp',
+        'SpeedAvg': 'wind_speed',
+        'DirectionAvg': 'wind_direction',
+        'TemperatureAvg': 'temperature',
+        'PressureAvg': 'pressure',
+        'HumidtyAvg': 'humidity'
+    })
+
+    df_50m = df_50m.rename(columns={
+        'Date & Time Stamp': 'timestamp',
+        'SpeedAvg': 'wind_speed',
+        'DirectionAvg': 'wind_direction',
+        'TemperatureAvg': 'temperature',
+        'PressureAvg': 'pressure',
+        'HumidtyAvg': 'humidity'
+    })
+
+    df_100m = df_100m.rename(columns={
+        'Date & Time Stamp': 'timestamp',
+        'SpeedAvg': 'wind_speed',
+        'DirectionAvg': 'wind_direction',
+        'TemperatureAvg': 'temperature',
+        'PressureAvg': 'pressure',
+        'HumidtyAvg': 'humidity'
+    })
+
+    # 提取公共特征列
+    common_cols = ['timestamp', 'wind_speed', 'wind_direction', 'temperature', 'pressure', 'humidity']
+    df_10m = df_10m[common_cols]
+    df_50m = df_50m[common_cols]
+    df_100m = df_100m[common_cols]
+
+    # 合并数据集
+    df_merged = pd.merge(df_10m, df_50m, on='timestamp', suffixes=('_10m', '_50m'))
+    df_merged = pd.merge(df_merged, df_100m, on='timestamp', suffixes=('', '_100m'))
+
+    # 重命名目标列
+    df_merged = df_merged.rename(columns={
+        'wind_speed': 'wind_speed_100m',
+        'wind_direction': 'wind_direction_100m',
+        'temperature': 'temperature_100m',
+        'pressure': 'pressure_100m',
+        'humidity': 'humidity_100m'
+    })
+
+    return df_merged
+
+# 2. 数据预处理
+def preprocess_data(df):
+    # 时间戳处理
+    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+    df = df.sort_values('timestamp').reset_index(drop=True)
+
+    # 缺失值处理
+    df = df.ffill()
+
+    # 异常值处理
+    def handle_outliers(data, col):
+        mean = data[col].mean()
+        std = data[col].std()
+        lower = mean - 3 * std
+        upper = mean + 3 * std
+        data[col] = data[col].clip(lower, upper)
+        return data
+
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    for col in numeric_cols:
+        df = handle_outliers(df, col)
+
+    return df, numeric_cols
+
+# 3. 特征工程
+def feature_engineering(df, numeric_cols):
+    # 时间特征
+    df['hour'] = df['timestamp'].dt.hour
+    df['day_of_week'] = df['timestamp'].dt.dayofweek
+    df['month'] = df['timestamp'].dt.month
+
+    # 滞后特征
+    window_size = 48  # 8小时，10分钟一个样本
+    forecast_step_1 = 6  # 1小时
+    forecast_step_2 = 96  # 16小时
+
+    for col in numeric_cols:
+        for i in range(1, window_size + 1):
+            df[f'{col}_lag_{i}'] = df[col].shift(i)
+
+    # 目标变量
+    df['target_single_step'] = df['wind_speed_100m'].shift(-1)
+    df['target_multi_step_1h'] = df['wind_speed_100m'].shift(-forecast_step_1)
+    df['target_multi_step_16h'] = df['wind_speed_100m'].shift(-forecast_step_2)
+
+    # 去除NaN
+    df = df.dropna().reset_index(drop=True)
+
+    # 特征和目标分离
+    feature_cols = [col for col in df.columns if 'lag_' in col or col in ['hour', 'day_of_week', 'month']]
+    target_cols = {
+        'single_step': 'target_single_step',
+        'multi_step_1h': 'target_multi_step_1h',
+        'multi_step_16h': 'target_multi_step_16h'
+    }
+
+    return df, feature_cols, target_cols, window_size
+
+# 4. 数据集划分
+def split_dataset(df, feature_cols, target_cols):
+    train_size = 0.7
+    val_size = 0.2
+    test_size = 0.1
+
+    train_val, test = train_test_split(df, test_size=test_size, shuffle=False, random_state=SEED)
+    train, val = train_test_split(train_val, test_size=val_size/(train_size+val_size), shuffle=False, random_state=SEED)
+
+    # 特征标准化
+    scaler = StandardScaler()
+    train_scaled = scaler.fit_transform(train[feature_cols])
+    val_scaled = scaler.transform(val[feature_cols])
+    test_scaled = scaler.transform(test[feature_cols])
+
+    return train, val, test, train_scaled, val_scaled, test_scaled, scaler
+
+# 5. 模型定义
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=2):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+        self.dropout = nn.Dropout(0.2)
+    
+    def forward(self, x):
+        x, _ = self.lstm(x)
+        x = self.dropout(x[:, -1, :])
+        x = self.fc(x)
+        return x
+
+class TransformerModel(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=2, nhead=8):
+        super(TransformerModel, self).__init__()
+        self.encoder_layer = nn.TransformerEncoderLayer(d_model=input_size, nhead=nhead, dim_feedforward=hidden_size)
+        self.transformer_encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=num_layers)
+        self.fc = nn.Linear(input_size, output_size)
+        self.dropout = nn.Dropout(0.2)
+    
+    def forward(self, x):
+        x = x.permute(1, 0, 2)
+        x = self.transformer_encoder(x)
+        x = self.dropout(x[-1, :, :])
+        x = self.fc(x)
+        return x
+
+class WindDataset(Dataset):
+    def __init__(self, data, target):
+        self.data = torch.tensor(data, dtype=torch.float32)
+        self.target = torch.tensor(target, dtype=torch.float32)
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        return self.data[idx], self.target[idx]
+
+# 6. 训练函数
+def train_model(model, train_loader, val_loader, criterion, optimizer, epochs=50, device='cpu'):
+    model.to(device)
+    train_losses = []
+    val_losses = []
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+        for batch_X, batch_y in train_loader:
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+            optimizer.zero_grad()
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item() * batch_X.size(0)
+        train_loss /= len(train_loader.dataset)
+        train_losses.append(train_loss)
+        
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch_X, batch_y in val_loader:
+                batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                outputs = model(batch_X)
+                loss = criterion(outputs, batch_y)
+                val_loss += loss.item() * batch_X.size(0)
+        val_loss /= len(val_loader.dataset)
+        val_losses.append(val_loss)
+        
+        if (epoch + 1) % 10 == 0:
+            print(f'Epoch [{epoch+1}/{epochs}], Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+    return model, train_losses, val_losses
+
+# 7. 评估函数
+def evaluate_model(model, X_test, y_test, scaler, is_deep=False, device='cpu'):
+    model.eval()
+    if is_deep:
+        X_test = torch.tensor(X_test, dtype=torch.float32).to(device)
+        with torch.no_grad():
+            y_pred = model(X_test).cpu().numpy()
+    else:
+        y_pred = model.predict(X_test)
+    
+    # 反标准化
+    y_pred = scaler.inverse_transform(y_pred)
+    y_test = scaler.inverse_transform(y_test)
+    
+    # 计算指标
+    mse = mean_squared_error(y_test, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+    
+    return {
+        'MSE': mse,
+        'RMSE': rmse,
+        'MAE': mae,
+        'R²': r2
+    }, y_pred, y_test
+
+# 8. 可视化函数
+def visualize_results(df, lr_results):
+    plt.rcParams['font.sans-serif'] = ['SimHei']
+    plt.rcParams['axes.unicode_minus'] = False
+
+    # 风速分布
+    plt.figure(figsize=(12, 8))
+    sns.histplot(df['wind_speed_100m'], kde=True, bins=30)
+    plt.title('100米高度风速分布', fontsize=14)
+    plt.xlabel('风速 (m/s)', fontsize=12)
+    plt.ylabel('频数', fontsize=12)
+    plt.grid(alpha=0.3)
+    plt.savefig('results/风速分布.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # 特征相关性热力图
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    plt.figure(figsize=(12, 10))
+    corr = df[numeric_cols].corr()
+    sns.heatmap(corr, annot=True, cmap='coolwarm', vmin=-1, vmax=1, fmt='.2f')
+    plt.title('特征相关性热力图', fontsize=14)
+    plt.savefig('results/特征相关性热力图.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # 预测结果对比图
+    for task_name, results in lr_results.items():
+        plt.figure(figsize=(15, 8))
+        true_vals = results['true'].flatten()
+        lr_pred = results['predictions'].flatten()
+
+        plt.plot(true_vals[:200], label='真实值', color='black', linewidth=1.5)
+        plt.plot(lr_pred[:200], label='线性回归预测值', color='blue', alpha=0.7)
+
+        plt.title(f'{task_name}任务：真实值 vs 线性回归预测值', fontsize=14)
+        plt.xlabel('样本序号', fontsize=12)
+        plt.ylabel('风速 (m/s)', fontsize=12)
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.savefig(f'results/{task_name}预测结果对比.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+    print("可视化图表已保存到results目录")
+
+# 9. 主函数
+def main():
+    # 加载数据
+    print("===== 1. 加载数据 =====")
+    df_merged = load_and_merge_data()
+    print(f"合并后数据集形状: {df_merged.shape}")
+
+    # 数据预处理
+    print("\n===== 2. 数据预处理 =====")
+    df_processed, numeric_cols = preprocess_data(df_merged)
+    print(f"预处理后数据集形状: {df_processed.shape}")
+
+    # 特征工程
+    print("\n===== 3. 特征工程 =====")
+    df_featured, feature_cols, target_cols, window_size = feature_engineering(df_processed, numeric_cols)
+    print(f"特征工程后数据集形状: {df_featured.shape}")
+    print(f"特征数量: {len(feature_cols)}")
+    print(f"预测任务: {list(target_cols.keys())}")
+
+    # 数据集划分
+    print("\n===== 4. 数据集划分 =====")
+    train, val, test, train_scaled, val_scaled, test_scaled, scaler = split_dataset(df_featured, feature_cols, target_cols)
+    print(f"训练集大小: {train.shape}")
+    print(f"验证集大小: {val.shape}")
+    print(f"测试集大小: {test.shape}")
+
+    # 模型训练与评估
+    print("\n===== 5. 模型训练与评估 =====")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
+
+    results = {}
+    input_size = len(feature_cols) // window_size
+
+    for task_name, target_col in target_cols.items():
+        print(f"\n--- 任务: {task_name} ---")
+        # 准备数据
+        target_scaler = StandardScaler()
+        y_train = target_scaler.fit_transform(train[target_col].values.reshape(-1, 1))
+        y_val = target_scaler.transform(val[target_col].values.reshape(-1, 1))
+        y_test = target_scaler.transform(test[target_col].values.reshape(-1, 1))
+
+        # 深度学习模型数据准备
+        train_dataset = WindDataset(train_scaled.reshape(-1, window_size, input_size), y_train)
+        val_dataset = WindDataset(val_scaled.reshape(-1, window_size, input_size), y_val)
+        test_dataset = WindDataset(test_scaled.reshape(-1, window_size, input_size), y_test)
+
+        batch_size = 32
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+        # 线性回归模型
+        print("\n线性回归模型:")
+        lr_model = LinearRegression()
+        lr_model.fit(train_scaled, y_train)
+        lr_metrics, lr_pred, lr_true = evaluate_model(lr_model, test_scaled, y_test, target_scaler, is_deep=False)
+        print(f"评估指标: {lr_metrics}")
+
+        # LSTM模型
+        print("\nLSTM模型:")
+        lstm_model = LSTMModel(input_size, hidden_size=128, output_size=1)
+        criterion = nn.MSELoss()
+        optimizer = optim.Adam(lstm_model.parameters(), lr=0.001)
+        lstm_model, _, _ = train_model(lstm_model, train_loader, val_loader, criterion, optimizer, epochs=50, device=device)
+        lstm_metrics, lstm_pred, lstm_true = evaluate_model(lstm_model, test_scaled.reshape(-1, window_size, input_size), y_test, target_scaler, is_deep=True, device=device)
+        print(f"评估指标: {lstm_metrics}")
+        torch.save(lstm_model.state_dict(), f'results/lstm_model_{task_name}.pth')
+
+        # Transformer模型
+        print("\nTransformer模型:")
+        transformer_model = TransformerModel(input_size, hidden_size=256, output_size=1)
+        criterion = nn.MSELoss()
+        optimizer = optim.Adam(transformer_model.parameters(), lr=0.001)
+        transformer_model, _, _ = train_model(transformer_model, train_loader, val_loader, criterion, optimizer, epochs=50, device=device)
+        transformer_metrics, transformer_pred, transformer_true = evaluate_model(transformer_model, test_scaled.reshape(-1, window_size, input_size), y_test, target_scaler, is_deep=True, device=device)
+        print(f"评估指标: {transformer_metrics}")
+        torch.save(transformer_model.state_dict(), f'results/transformer_model_{task_name}.pth')
+
+        # 保存结果
+        results[task_name] = {
+            '线性回归': lr_metrics,
+            'LSTM': lstm_metrics,
+            'Transformer': transformer_metrics,
+            'predictions': {
+                '线性回归': lr_pred,
+                'LSTM': lstm_pred,
+                'Transformer': transformer_pred,
+                'true': lr_true
+            }
+        }
+
+    # 结果汇总
+    print("\n===== 6. 结果汇总 =====")
+    summary_data = []
+    for task_name, task_results in results.items():
+        for model_name, metrics in task_results.items():
+            if model_name != 'predictions':
+                summary_data.append({
+                    '预测任务': task_name,
+                    '模型': model_name,
+                    'MSE': metrics['MSE'],
+                    'RMSE': metrics['RMSE'],
+                    'MAE': metrics['MAE'],
+                    'R²': metrics['R²']
+                })
+
+    summary_df = pd.DataFrame(summary_data)
+    summary_df.to_excel('results/模型评估结果汇总.xlsx', index=False)
+    print("模型评估结果汇总已保存到results/模型评估结果汇总.xlsx")
+    print(summary_df.round(4))
+
+    # 可视化
+    print("\n===== 7. 可视化 =====")
+    visualize_results(df_featured, {k: v['线性回归'] for k, v in results.items()})
+
+    print("\n===== 所有任务完成 =====")
+
+if __name__ == '__main__':
+    main()
